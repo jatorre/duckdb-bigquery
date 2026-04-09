@@ -175,13 +175,13 @@ SELECT * FROM bigquery_query('${BQ_TEST_PROJECT}', '
 ----
 {'id': NULL, 'name': hello}
 
-# Type coverage: ARRAY with NULL elements
-query I
+# Type coverage: ARRAY with NULL elements (BigQuery does not allow NULL array elements)
+statement error
 SELECT * FROM bigquery_query('${BQ_TEST_PROJECT}', '
     SELECT [1, NULL, 3] AS arr
 ', use_rest_api=true);
 ----
-[1, NULL, 3]
+Array cannot have a null element
 
 statement ok
 SET bq_debug_show_queries = false;
