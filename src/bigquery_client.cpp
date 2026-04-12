@@ -43,6 +43,7 @@
 #include "arrow/ipc/writer.h"
 #include "grpcpp/grpcpp.h"
 
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -810,6 +811,7 @@ shared_ptr<BigqueryArrowReader> BigqueryClient::CreateArrowReader(const Bigquery
 }
 
 shared_ptr<BigqueryProtoWriter> BigqueryClient::CreateProtoWriter(BigqueryTableEntry *entry) {
+    auto t_start = std::chrono::steady_clock::now();
     CheckAuthentication();
 
     if (entry == nullptr) {
@@ -820,52 +822,105 @@ shared_ptr<BigqueryProtoWriter> BigqueryClient::CreateProtoWriter(BigqueryTableE
         throw InternalException("Error while initializing proto writer: project_id mismatch");
     }
 
-    // Check if dataset exists with an exponential backoff retry
+    // Check if table exists with an exponential backoff retry
+    auto t_table_check = std::chrono::steady_clock::now();
     auto op = [this, &entry]() -> bool { return TableExists(entry->schema.name, entry->name); };
     auto success = RetryOperation(op, 10, 1000);
+    auto t_table_done = std::chrono::steady_clock::now();
+    std::cout << "[bigquery-perf] TableExists check: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t_table_done - t_table_check).count()
+              << "ms" << std::endl;
     if (!success) {
         throw InternalException("Failed to verify that \"%s.%s\" exists.", entry->schema.name, entry->name);
     }
 
-    auto options = OptionsGRPC()
-                       .set<google::cloud::bigquery_storage_v1::BigQueryWriteConnectionIdempotencyPolicyOption>(
-                           CustomWriteIdempotencyPolicy().clone())
-                       .set<google::cloud::bigquery_storage_v1::BigQueryWriteRetryPolicyOption>(
-                           google::cloud::bigquery_storage_v1::BigQueryWriteLimitedErrorCountRetryPolicy(5).clone())
-                       .set<google::cloud::bigquery_storage_v1::BigQueryWriteBackoffPolicyOption>(
-                           google::cloud::ExponentialBackoffPolicy(
-                               /*initial_delay=*/std::chrono::milliseconds(200),
-                               /*maximum_delay=*/std::chrono::seconds(45),
-                               /*scaling=*/2.0)
-                               .clone());
+    auto t_conn_start = std::chrono::steady_clock::now();
+    auto connection = GetOrCreateWriteConnection();
+    auto t_conn_done = std::chrono::steady_clock::now();
+    std::cout << "[bigquery-perf] GetOrCreateWriteConnection: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t_conn_done - t_conn_start).count()
+              << "ms (cached=" << (t_conn_done - t_conn_start < std::chrono::milliseconds(10) ? "yes" : "no") << ")"
+              << std::endl;
 
-    return make_shared_ptr<BigqueryProtoWriter>(entry, options);
+    auto t_writer_start = std::chrono::steady_clock::now();
+    auto writer = make_shared_ptr<BigqueryProtoWriter>(entry, connection, [this]() {
+        InvalidateWriteConnection();
+        return GetOrCreateWriteConnection();
+    });
+    auto t_writer_done = std::chrono::steady_clock::now();
+    std::cout << "[bigquery-perf] ProtoWriter construction (incl. CreateWriteStream): "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t_writer_done - t_writer_start).count()
+              << "ms" << std::endl;
+
+    std::cout << "[bigquery-perf] CreateProtoWriter total: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t_writer_done - t_start).count()
+              << "ms" << std::endl;
+
+    return writer;
+}
+
+std::shared_ptr<google::cloud::bigquery_storage_v1::BigQueryWriteConnection> BigqueryClient::GetOrCreateWriteConnection() {
+    if (!cached_write_connection) {
+        auto t_start = std::chrono::steady_clock::now();
+        auto options = OptionsGRPC()
+                           .set<google::cloud::bigquery_storage_v1::BigQueryWriteConnectionIdempotencyPolicyOption>(
+                               CustomWriteIdempotencyPolicy().clone())
+                           .set<google::cloud::bigquery_storage_v1::BigQueryWriteRetryPolicyOption>(
+                               google::cloud::bigquery_storage_v1::BigQueryWriteLimitedErrorCountRetryPolicy(5).clone())
+                           .set<google::cloud::bigquery_storage_v1::BigQueryWriteBackoffPolicyOption>(
+                               google::cloud::ExponentialBackoffPolicy(
+                                   /*initial_delay=*/std::chrono::milliseconds(200),
+                                   /*maximum_delay=*/std::chrono::seconds(45),
+                                   /*scaling=*/2.0)
+                                   .clone());
+        cached_write_connection = google::cloud::bigquery_storage_v1::MakeBigQueryWriteConnection(options);
+        auto t_end = std::chrono::steady_clock::now();
+        std::cout << "[bigquery-perf] MakeBigQueryWriteConnection (cold): "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count()
+                  << "ms" << std::endl;
+    }
+    return cached_write_connection;
+}
+
+void BigqueryClient::InvalidateWriteConnection() {
+    cached_write_connection.reset();
 }
 
 google::cloud::bigquery::v2::QueryResponse BigqueryClient::ExecuteQuery(const string &query,
                                                                         const string &location,
                                                                         const bool &dry_run,
-                                                                        const vector<Value> &query_parameters) {
+                                                                        const vector<Value> &query_parameters,
+                                                                        const bool &optional_job_creation) {
     CheckAuthentication();
 
     auto client = google::cloud::bigquerycontrol_v2::JobServiceClient(
         google::cloud::bigquerycontrol_v2::MakeJobServiceConnectionRest(OptionsAPI()));
 
-    auto response = PostQueryJobInternal(client, query, location, dry_run, query_parameters);
+    auto response = PostQueryJobInternal(client, query, location, dry_run, query_parameters, optional_job_creation);
     if (!response.ok()) {
         ThrowOnErrorStatus(response.status());
 
         if (CheckSSLError(response.status())) {
-            return ExecuteQuery(query, location, dry_run, query_parameters);
+            return ExecuteQuery(query, location, dry_run, query_parameters, optional_job_creation);
         }
 
-        throw BinderException("Query execution failed: " + response.status().message());
+        const auto &message = response.status().message();
+        if (message.find("Array cannot have a null element") != string::npos) {
+            throw BinderException("Query execution failed: BigQuery does not allow query results with ARRAY values "
+                                  "that contain NULL elements. Original error: " +
+                                  message);
+        }
+
+        throw BinderException("Query execution failed: " + message);
     }
 
     auto complete = response->job_complete().value();
     if (!complete) {
-        auto job_id = response->job_reference().job_id();
-        throw BinderException("Query execution exceeded the timeout. Job ID: " + job_id);
+        if (response->has_job_reference()) {
+            auto job_id = response->job_reference().job_id();
+            throw BinderException("Query execution exceeded the timeout. Job ID: " + job_id);
+        }
+        throw BinderException("Query execution exceeded the timeout.");
     }
 
     return *response;
@@ -921,7 +976,8 @@ google::cloud::StatusOr<google::cloud::bigquery::v2::QueryResponse> BigqueryClie
     const string &query,
     const string &location,
     const bool &dry_run,
-    const vector<Value> &query_parameters) {
+    const vector<Value> &query_parameters,
+    const bool &optional_job_creation) {
 
     if (!dry_run && BigquerySettings::DebugQueryPrint()) {
         std::cout << "query: " << query << std::endl;
@@ -938,6 +994,14 @@ google::cloud::StatusOr<google::cloud::bigquery::v2::QueryResponse> BigqueryClie
     query_request.mutable_use_legacy_sql()->set_value(false);
     // query_request.mutable_max_results()->set_value(3);
     query_request.set_dry_run(dry_run);
+
+    // Use optional job creation mode: BigQuery will return results inline
+    // for short-running queries, avoiding the overhead of job + Storage API.
+    // When the caller needs a job reference (e.g. for Storage API reads),
+    // they should pass optional_job_creation=false.
+    if (!dry_run && optional_job_creation) {
+        query_request.set_job_creation_mode(google::cloud::bigquery::v2::QueryRequest::JOB_CREATION_OPTIONAL);
+    }
 
     int timeout_ms = BigquerySettings::QueryTimeoutMs();
     query_request.mutable_timeout_ms()->set_value(timeout_ms);
